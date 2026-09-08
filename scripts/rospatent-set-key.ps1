@@ -1,4 +1,4 @@
-# Разово: сохраняет ROSPATENT_API_KEY зашифрованным через Windows DPAPI
+﻿# Разово: сохраняет ROSPATENT_API_KEY зашифрованным через Windows DPAPI
 # (System.Security.Cryptography.ProtectedData, область CurrentUser).
 #
 # Что это даёт: файл .secrets\rospatent_key.enc на диске — не текст ключа,

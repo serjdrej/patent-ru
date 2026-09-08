@@ -1,4 +1,4 @@
-# Обёртка вокруг rospatent.py: расшифровывает ROSPATENT_API_KEY из
+﻿# Обёртка вокруг rospatent.py: расшифровывает ROSPATENT_API_KEY из
 # .secrets\rospatent_key.enc (зашифрован Windows DPAPI, см. rospatent-set-key.ps1)
 # и передаёт его ТОЛЬКО дочернему процессу python.exe — на время одного вызова.
 # После завершения переменная нигде не остаётся, включая это же окно PowerShell.
