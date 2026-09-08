@@ -17,6 +17,8 @@
 # Запуск (в своём PowerShell, не через агента — ключ вводится скрыто, как пароль):
 #   .\rospatent-set-key.ps1
 
+$ErrorActionPreference = "Stop"
+
 $secretsDir = Join-Path $PSScriptRoot "..\.secrets"
 New-Item -ItemType Directory -Force -Path $secretsDir | Out-Null
 $keyFile = Join-Path $secretsDir "rospatent_key.enc"
