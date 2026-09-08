@@ -210,7 +210,9 @@ def main() -> int:
     s = sub.add_parser("search")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=SAFE_LIMIT)
-    s.add_argument("--world", action="store_true", help="снять фильтр по RU/SU")
+    s.add_argument("--world", action="store_true", help="снять фильтр по странам совсем")
+    s.add_argument("--country", default="", help="код(ы) страны через запятую, напр. CN или CN,KR — "
+                                                    "вместо умолчания RU,SU; см. datasets для перечня")
 
     d = sub.add_parser("doc")
     d.add_argument("pid", nargs="+")
@@ -228,7 +230,13 @@ def main() -> int:
     c = Client(priority=a.priority, outdir=a.out or None)
 
     if a.cmd == "search":
-        res, err = c.search(a.query, limit=a.limit, countries=False if a.world else None)
+        if a.world:
+            countries = False
+        elif a.country:
+            countries = [x.strip().upper() for x in a.country.split(",") if x.strip()]
+        else:
+            countries = None
+        res, err = c.search(a.query, limit=a.limit, countries=countries)
         if err:
             print("ОШИБКА:", err); return 1
         c.save("search.json", res)
