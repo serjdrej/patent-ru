@@ -95,13 +95,24 @@ class Client:
             json.dump(obj, f, ensure_ascii=False, indent=1)
 
     # ------------------------------------------------------------------ методы
-    def search(self, q: str, limit: int = SAFE_LIMIT, countries=None, **extra):
+    def search(self, q: str, limit: int = SAFE_LIMIT, countries=None,
+               datasets=None, offset: int = 0, group_by: str = "", **extra):
         if limit > SAFE_LIMIT:
             print(f"  [!] limit={limit} > {SAFE_LIMIT}: возможен IncompleteRead, "
                   f"добирайте через offset", file=sys.stderr)
         payload = {"q": q, "limit": limit, "sort": "relevance"}
+        if offset:
+            payload["offset"] = offset
         if countries is not False:
             payload["filter"] = {"country": {"values": countries or RU_FUND}}
+        if datasets:
+            # массивы ИС ПП: ep / us / pct / cn / jp / kr / de / fr / gb / ca / au /
+            # at / ch / ap / ru_since_1994 / ru_till_1994 / cis / others.
+            # При явном указании datasets фильтр по странам, как правило, нужно
+            # снимать (--world), иначе умолчание RU,SU обнулит выдачу.
+            payload["datasets"] = datasets
+        if group_by:
+            payload["group_by"] = group_by          # "family:docdb" | "family:dwpi"
         payload.update(extra)
         res, err = self.call("search", payload)
         if res:
@@ -147,6 +158,19 @@ class Client:
         time.sleep(RATE_SLEEP)
         return res, err
 
+    def ipc_search(self, text: str, lang: str = "ru", count: int = 15):
+        """Поиск индексов МПК по тексту: POST /classification/ipc/search/."""
+        res, err = self.call("classification/ipc/search/",
+                             {"q": text, "lang": lang, "count": count})
+        time.sleep(RATE_SLEEP)
+        return res, err
+
+    def ipc_code(self, code: str, lang: str = "ru"):
+        """Расшифровка индекса МПК: POST /classification/ipc/code/."""
+        res, err = self.call("classification/ipc/code/", {"code": code, "lang": lang})
+        time.sleep(RATE_SLEEP)
+        return res, err
+
     def audit(self) -> str:
         return (f"Запросов отправлено: {self.sent}. Документов получено: {self.received}. "
                 f"Отказов источника: {len(self.failures)}.")
@@ -166,19 +190,48 @@ def deep(o, *keys):
     return o
 
 
+def _lang(doc: dict, block: str) -> str:
+    """Текст блока на первом доступном языке: ru → en → что есть.
+
+    Для зарубежных массивов (`us`, `ep`, `pct`, ...) поля `*.ru` пусты — формула
+    лежит в `claims.en`, у китайских заявок РСТ только в `claims.zh`.
+    """
+    b = doc.get(block) or {}
+    if not isinstance(b, dict):
+        return ""
+    for lg in ("ru", "en"):
+        if b.get(lg):
+            return strip(b[lg])
+    for lg, v in b.items():
+        if v:
+            return f"[{lg}] " + strip(v)
+    return ""
+
+
 def fields(doc: dict) -> dict:
     """Поля, которые реально нужны, из ответа /docs."""
-    ru = deep(doc, "biblio", "ru") or deep(doc, "biblio", "en") or {}
+    bib = doc.get("biblio") or {}
+    ru = bib.get("ru") or bib.get("en") or (next(iter(bib.values()), {}) if bib else {})
     holders = ru.get("patentee") or []
-    ipc = deep(doc, "common", "classification", "ipcr") or []
+    if not holders:                      # у части зарубежных записей — только applicant
+        holders = ru.get("applicant") or []
+    cls = deep(doc, "common", "classification") or {}
+    ipc = cls.get("ipcr") or cls.get("ipc") or []
+    cpc = cls.get("cpc") or []
+    prio = deep(doc, "common", "priority") or []
+    prio_s = "; ".join(f"{p.get('publishing_office','')}{p.get('number','')} "
+                       f"от {p.get('filing_date','')}".strip()
+                       for p in prio if isinstance(p, dict) and p.get("filing_date"))
     return {
         "id": doc.get("id", ""),
         "title": strip(ru.get("title")),
         "patentee": ", ".join(strip(p.get("name", "")) for p in holders if isinstance(p, dict)),
         "ipc": ", ".join(strip(c.get("fullname", "")) for c in ipc if isinstance(c, dict)),
+        "cpc": ", ".join(strip(c.get("fullname", "")) for c in cpc if isinstance(c, dict)),
+        "priority": prio_s,
         "publication_date": deep(doc, "common", "publication_date") or "",
-        "abstract": strip(deep(doc, "abstract", "ru")),
-        "claims": strip(deep(doc, "claims", "ru")),
+        "abstract": _lang(doc, "abstract"),
+        "claims": _lang(doc, "claims"),
     }
 
 
@@ -188,7 +241,9 @@ def digest(res: dict, label: str, limit: int = 15, priority: str = "") -> None:
     print(f"\n### {label} — всего {(res or {}).get('total', len(hits))}, "
           f"показано {min(limit, len(hits))}")
     for h in hits[:limit]:
-        ru = deep(h, "biblio", "ru") or {}
+        # у зарубежных массивов biblio.ru пуст — название лежит в biblio.en/de/fr/zh
+        bib = h.get("biblio") or {}
+        ru = bib.get("ru") or bib.get("en") or (next(iter(bib.values()), {}) if bib else {})
         pid = h.get("id", "?")
         pd = deep(h, "common", "publication_date") or h.get("publication_date", "")
         flag = ""
@@ -213,6 +268,12 @@ def main() -> int:
     s.add_argument("--world", action="store_true", help="снять фильтр по странам совсем")
     s.add_argument("--country", default="", help="код(ы) страны через запятую, напр. CN или CN,KR — "
                                                     "вместо умолчания RU,SU; см. datasets для перечня")
+    s.add_argument("--datasets", default="", help="массив(ы) ИС ПП через запятую: ep,us,pct,cn,jp,kr,"
+                                                  "de,fr,gb,ca,au,at,ch,ap,ru_since_1994,cis,others. "
+                                                  "Обычно вместе с --world")
+    s.add_argument("--offset", type=int, default=0, help="сдвиг выдачи для добора при limit<=10")
+    s.add_argument("--group-by", default="", help="'family:docdb' или 'family:dwpi' — свернуть "
+                                                  "патентные семьи, снимает двойной счёт")
 
     d = sub.add_parser("doc")
     d.add_argument("pid", nargs="+")
@@ -225,6 +286,14 @@ def main() -> int:
     m.add_argument("--count", type=int, default=50)
 
     sub.add_parser("datasets")
+
+    i = sub.add_parser("ipc", help="классификатор МПК: поиск индекса по тексту или расшифровка кода")
+    gi = i.add_mutually_exclusive_group(required=True)
+    gi.add_argument("--query", help="текст для подбора индексов МПК")
+    gi.add_argument("--code", help="индекс МПК для расшифровки, напр. 'G01C 15/00'")
+    i.add_argument("--lang", default="ru")
+    i.add_argument("--count", type=int, default=15)
+
     a = ap.parse_args()
 
     c = Client(priority=a.priority, outdir=a.out or None)
@@ -236,7 +305,9 @@ def main() -> int:
             countries = [x.strip().upper() for x in a.country.split(",") if x.strip()]
         else:
             countries = None
-        res, err = c.search(a.query, limit=a.limit, countries=countries)
+        ds = [x.strip() for x in a.datasets.split(",") if x.strip()] or None
+        res, err = c.search(a.query, limit=a.limit, countries=countries,
+                            datasets=ds, offset=a.offset, group_by=a.group_by)
         if err:
             print("ОШИБКА:", err); return 1
         c.save("search.json", res)
@@ -250,7 +321,7 @@ def main() -> int:
             c.save(f"{res.get('id', pid)}.json", res)
             f = fields(res)
             print(f"\n{'=' * 96}\n### {f['id'] or pid}")
-            for k in ("title", "patentee", "ipc", "publication_date"):
+            for k in ("title", "patentee", "ipc", "cpc", "priority", "publication_date"):
                 if f[k]:
                     print(f"  {k:17}: {f[k][:130]}")
             if f["abstract"]:
@@ -276,6 +347,14 @@ def main() -> int:
         if err:
             print("ОШИБКА:", err); return 1
         print(json.dumps(res, ensure_ascii=False, indent=1)[:4000])
+
+    elif a.cmd == "ipc":
+        res, err = (c.ipc_search(a.query, a.lang, a.count) if a.query
+                    else c.ipc_code(a.code, a.lang))
+        if err:
+            print("ОШИБКА:", err); return 1
+        c.save("ipc.json", res)
+        print(json.dumps(res, ensure_ascii=False, indent=1)[:6000])
 
     print("\n" + c.audit())
     for path, err in c.failures:
