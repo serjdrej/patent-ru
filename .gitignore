@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Локальный ключ ROSPATENT_API_KEY (см. .secrets/README.txt и scripts/rospatent.ps1).
+# Ничего отсюда не должно попасть в репозиторий ни при каких обстоятельствах,
+# кроме самого README с инструкцией (он не секрет).
+.secrets/*
+!.secrets/README.txt
