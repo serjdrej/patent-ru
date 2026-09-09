@@ -129,11 +129,25 @@ def _win_load() -> str | None:
 
 
 # --------------------------------------------------------------- macOS (Keychain)
-def _mac_save(key: str) -> None:
-    subprocess.run(
-        ["security", "add-generic-password", "-a", _account(), "-s", SERVICE, "-w", key, "-U"],
-        check=True, capture_output=True, text=True,
-    )
+def _mac_save_interactive() -> bool:
+    """Просит и сохраняет ключ, не передавая его через argv.
+
+    Умышленно НЕ принимает готовое значение ключа и НЕ использует `-w <значение>`:
+    `security` в списке процессов другого пользователя того же логина виден как
+    обычный `ps`-вывод, и значение `-w` было бы видно там же. Вместо этого `-w`
+    оставлен без значения — `security` сам просит его с терминала (readpassphrase
+    через /dev/tty, независимо от перенаправления stdin/stdout), поэтому ключ на
+    этом пути ни разу не существует ни как аргумент процесса, ни как переменная
+    Python. Требует реального терминала (интерактивный запуск, не CI/pipe).
+    """
+    try:
+        result = subprocess.run(
+            ["security", "add-generic-password", "-a", _account(), "-s", SERVICE, "-U"]
+        )
+    except FileNotFoundError:
+        print("Утилита `security` не найдена.", file=sys.stderr)
+        return False
+    return result.returncode == 0
 
 
 def _mac_load() -> str | None:
@@ -150,19 +164,46 @@ def _mac_load() -> str | None:
 
 
 # ------------------------------------------------------------------------- API
-def save_key(key: str) -> None:
+def set_key_interactive() -> bool:
+    """Спрашивает ключ (скрытым вводом) и сохраняет его. True — при успехе.
+
+    Ввод и сохранение объединены в одну функцию намеренно: на macOS сам ввод
+    делает `security` (см. `_mac_save_interactive`) — ключ никогда не становится
+    строкой в этом процессе Python, так что отдельного шага "получить ключ, потом
+    передать на сохранение" здесь для macOS в принципе нет.
+    """
     if sys.platform == "win32":
+        try:
+            key = getpass.getpass(
+                "Вставьте ключ ROSPATENT_API_KEY (ввод не отображается на экране): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nОтменено.", file=sys.stderr)
+            return False
+        if not key:
+            print("Пустой ввод — ключ не сохранён.", file=sys.stderr)
+            return False
         _win_save(key)
-    elif sys.platform == "darwin":
-        _mac_save(key)
-    else:
-        raise RuntimeError(
-            "Автоматическое хранение ключа поддержано только на Windows и macOS. "
-            "На этой ОС используйте: export ROSPATENT_API_KEY=<ключ>"
-        )
+        return True
+    if sys.platform == "darwin":
+        print("Ключ спросит сама утилита security (стандартный скрытый ввод) — "
+              "значение не должно появляться в списке процессов.")
+        return _mac_save_interactive()
+    print("Автоматическое хранение ключа поддержано только на Windows и macOS. "
+          "На этой ОС используйте: export ROSPATENT_API_KEY=<ключ>", file=sys.stderr)
+    return False
 
 
 def load_key() -> str | None:
+    """Ключ из хранилища ОС, или None, если его там нет.
+
+    Побочный эффект на Windows: если ключ найден только в устаревшем
+    PowerShell-формате (`.secrets/rospatent_key.enc` внутри дерева скилла или
+    уже перенесённый файл в старом формате по новому пути), эта функция САМА
+    пишет его на диск в текущем формате по новому пути ("самолечение" — см.
+    `_win_load`), прежде чем его вернуть. Побочного эффекта нет, если ключ уже
+    хранится в текущем формате или отсутствует вовсе.
+    """
     if sys.platform == "win32":
         return _win_load()
     if sys.platform == "darwin":

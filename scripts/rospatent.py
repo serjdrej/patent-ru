@@ -29,7 +29,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import re
@@ -271,20 +270,7 @@ def digest(res: dict, label: str, limit: int = 15, priority: str = "") -> None:
 
 # ------------------------------------------------------------------------- cli
 def _cmd_set_key() -> int:
-    try:
-        key = getpass.getpass(
-            "Вставьте ключ ROSPATENT_API_KEY (ввод не отображается на экране): "
-        ).strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nОтменено.", file=sys.stderr)
-        return 1
-    if not key:
-        print("Пустой ввод — ключ не сохранён.", file=sys.stderr)
-        return 1
-    try:
-        keystore.save_key(key)
-    except Exception as e:                                        # noqa: BLE001
-        print(f"Не удалось сохранить: {e}", file=sys.stderr)
+    if not keystore.set_key_interactive():
         return 1
     print(f"Сохранено: {keystore.describe_location()}")
     print("Расположение не привязано к установке скилла — переустановка/перенос скилла ключ не затронет.")
