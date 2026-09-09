@@ -1,7 +1,11 @@
 ﻿# Обёртка вокруг rospatent.py: расшифровывает ROSPATENT_API_KEY из
-# .secrets\rospatent_key.enc (зашифрован Windows DPAPI, см. rospatent-set-key.ps1)
-# и передаёт его ТОЛЬКО дочернему процессу python.exe — на время одного вызова.
-# После завершения переменная нигде не остаётся, включая это же окно PowerShell.
+# %LOCALAPPDATA%\rospatent\rospatent_key.enc (зашифрован Windows DPAPI, см.
+# rospatent-set-key.ps1) и передаёт его ТОЛЬКО дочернему процессу python.exe —
+# на время одного вызова. После завершения переменная нигде не остаётся,
+# включая это же окно PowerShell.
+#
+# Ключ хранится ВНЕ дерева скилла намеренно — не зависит от того, откуда и
+# сколько раз скилл установлен/переустановлен/скопирован (см. rospatent-set-key.ps1).
 #
 # Разовая настройка (один раз на этом компьютере):
 #   .\rospatent-set-key.ps1
@@ -13,10 +17,22 @@
 #
 # Что защищает DPAPI, а что нет — см. комментарий в rospatent-set-key.ps1 и
 # references/search-rospatent.md.
+#
+# На macOS используйте вместо этого rospatent.sh (ключ из Keychain).
 
 $ErrorActionPreference = "Stop"
 
-$keyFile = Join-Path $PSScriptRoot "..\.secrets\rospatent_key.enc"
+$keyFile = Join-Path $env:LOCALAPPDATA "rospatent\rospatent_key.enc"
+
+# Разовая миграция: до перехода на путь, не привязанный к установке, ключ
+# сохранялся внутри дерева скилла (.secrets\rospatent_key.enc). Если новый
+# файл ещё не создан, а старый есть — переносим его молча один раз.
+$legacyKeyFile = Join-Path $PSScriptRoot "..\.secrets\rospatent_key.enc"
+if ((-not (Test-Path $keyFile)) -and (Test-Path $legacyKeyFile)) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $keyFile) | Out-Null
+    Copy-Item -LiteralPath $legacyKeyFile -Destination $keyFile
+    Write-Host "Ключ перенесён в $keyFile (расположение больше не привязано к установке скилла)."
+}
 
 if (-not (Test-Path $keyFile)) {
     Write-Error "Ключ не настроен: $keyFile не найден. Запустите один раз: .\rospatent-set-key.ps1"
