@@ -85,6 +85,55 @@ def _dpapi_unprotect(data: bytes) -> bytes:
     return _dpapi_call("CryptUnprotectData", data)
 
 
+def _win_read_hidden_input(prompt: str, timeout: float = 60.0) -> str:
+    """Скрытый ввод пароля/ключа с ограничением по времени (Windows).
+
+    Обычный `getpass.getpass()` на Windows блокируется в `msvcrt.getwch()`,
+    который читает НЕ из `sys.stdin`, а прямо с консоли, присоединённой к
+    процессу — перенаправление stdin (`< NUL`, пайп, запуск без интерактивного
+    ввода) на него не действует. Хуже того, проверка `sys.stdin.isatty()` тоже
+    ненадёжна как защита: на Windows `GetFileType` не отличает NUL от настоящей
+    консоли, так что `isatty()` может вернуть True даже при `< NUL` — проверено
+    эмпирически (`cmd /c "... < NUL"`). В сумме: без отдельного таймаута вызов
+    может зависнуть навсегда, если у процесса технически есть консоль, но
+    реального человека за клавиатурой нет (например, скрипт по ошибке запустил
+    агент). Поэтому здесь — опрос буфера клавиатуры (`kbhit`) вместо
+    блокирующего чтения, с общим лимитом времени; таймаут поднимает
+    `TimeoutError` вместо зависания.
+    """
+    import msvcrt
+    import time
+
+    print(prompt, end="", file=sys.stderr, flush=True)
+    chars: list[str] = []
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):        # спецклавиши — двухсимвольные последовательности
+                    msvcrt.getwch()
+                    continue
+                if ch in ("\r", "\n"):
+                    print(file=sys.stderr)
+                    return "".join(chars)
+                if ch == "\x03":                  # Ctrl+C
+                    raise KeyboardInterrupt
+                if ch == "\x08":                  # Backspace
+                    if chars:
+                        chars.pop()
+                    continue
+                chars.append(ch)
+                deadline = time.monotonic() + timeout   # таймаут отсчитывается от последнего символа
+                continue
+            if time.monotonic() > deadline:
+                print(file=sys.stderr)
+                raise TimeoutError(f"нет ввода {timeout:.0f} с")
+            time.sleep(0.05)
+    except OSError as e:
+        raise TimeoutError(f"консоль недоступна для чтения: {e}") from e
+
+
 def _win_save(key: str) -> None:
     path = _win_key_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,10 +191,15 @@ def _mac_save_interactive() -> bool:
     """
     try:
         result = subprocess.run(
-            ["security", "add-generic-password", "-a", _account(), "-s", SERVICE, "-U"]
+            ["security", "add-generic-password", "-a", _account(), "-s", SERVICE, "-U"],
+            timeout=60,
         )
     except FileNotFoundError:
         print("Утилита `security` не найдена.", file=sys.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        print("Нет ввода 60 с — похоже, запущено не в интерактивном терминале. "
+              "set-key нужно выполнить вручную в своём терминале.", file=sys.stderr)
         return False
     return result.returncode == 0
 
@@ -171,14 +225,30 @@ def set_key_interactive() -> bool:
     делает `security` (см. `_mac_save_interactive`) — ключ никогда не становится
     строкой в этом процессе Python, так что отдельного шага "получить ключ, потом
     передать на сохранение" здесь для macOS в принципе нет.
+
+    Требует реального терминала — на обеих ОС не должно зависать навсегда,
+    если его нет (см. `_win_read_hidden_input` и таймаут в `_mac_save_interactive`):
+    `sys.stdin.isatty()` ниже — быстрая, но НЕ надёжная проверка на Windows
+    (`GetFileType` не отличает NUL от настоящей консоли, так что `< NUL` может
+    пройти её как True — проверено эмпирически); настоящая защита от зависания —
+    таймаут внутри самого чтения на каждой ОС, а не эта проверка.
     """
+    if not sys.stdin.isatty():
+        print("Нужен интерактивный терминал (TTY) — set-key не читает ключ из "
+              "перенаправленного stdin/пайпа/CI и не должен запускаться так. "
+              "Выполните эту команду вручную в своём терминале.", file=sys.stderr)
+        return False
     if sys.platform == "win32":
         try:
-            key = getpass.getpass(
+            key = _win_read_hidden_input(
                 "Вставьте ключ ROSPATENT_API_KEY (ввод не отображается на экране): "
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nОтменено.", file=sys.stderr)
+            return False
+        except TimeoutError as e:
+            print(f"\nНет ввода — похоже, запущено не в интерактивном терминале ({e}). "
+                  "set-key нужно выполнить вручную в своём терминале.", file=sys.stderr)
             return False
         if not key:
             print("Пустой ввод — ключ не сохранён.", file=sys.stderr)
