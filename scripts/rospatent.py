@@ -5,15 +5,19 @@
 08.09.2026 по заявке № ⟦НОМЕР ЗАЯВКИ⟧; все обходные пути ниже проверены на практике,
 в официальной документации их нет.
 
-Ключ берётся ТОЛЬКО из ROSPATENT_API_KEY. В код, в логи и в сохраняемые файлы
-он не попадает.
+Ключ берётся из ROSPATENT_API_KEY, а если переменная не задана — из защищённого
+хранилища ОС (см. keystore.py: DPAPI на Windows, Keychain на macOS). В код, в
+логи и в сохраняемые файлы он не попадает.
 
-    export ROSPATENT_API_KEY=<ключ>
+    python rospatent.py set-key                         # разово на компьютер
     python rospatent.py search '(веха OR "измерительная штанга") AND инерциальн*'
     python rospatent.py doc RU2816552C1_20240401
     python rospatent.py doc RU2794881C1                 # дату подберёт сам
     python rospatent.py similar --file claim1.txt       # см. предупреждение ниже
     python rospatent.py datasets
+
+Без set-key — тот же export ROSPATENT_API_KEY=<ключ> работает как раньше, ключ
+из окружения всегда в приоритете над хранилищем.
 
 ПРЕДУПРЕЖДЕНИЕ О similar_search. В боевом прогоне метод оказался непригоден как
 доказательство: на текст п.1 формулы геодезического прибора (1448 знаков) выдал
@@ -25,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -32,6 +37,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # keystore.py лежит рядом
+import keystore
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # иначе '⚠' валит скрипт на Windows-консоли (cp1251)
 
@@ -45,9 +53,16 @@ RETRY_SLEEP = 3.0
 # --------------------------------------------------------------------------- io
 def _key() -> str:
     k = os.environ.get("ROSPATENT_API_KEY", "").strip()
-    if not k:
-        sys.exit("ROSPATENT_API_KEY не задана. Запуск отменён — ключ в код не вписывать.")
-    return k
+    if k:
+        return k
+    try:
+        stored = keystore.load_key()
+    except Exception:
+        stored = None
+    if stored:
+        return stored
+    sys.exit("ROSPATENT_API_KEY не задана и не найдена в хранилище ОС. "
+             "Разово: python rospatent.py set-key")
 
 
 class Client:
@@ -255,6 +270,28 @@ def digest(res: dict, label: str, limit: int = 15, priority: str = "") -> None:
 
 
 # ------------------------------------------------------------------------- cli
+def _cmd_set_key() -> int:
+    try:
+        key = getpass.getpass(
+            "Вставьте ключ ROSPATENT_API_KEY (ввод не отображается на экране): "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nОтменено.", file=sys.stderr)
+        return 1
+    if not key:
+        print("Пустой ввод — ключ не сохранён.", file=sys.stderr)
+        return 1
+    try:
+        keystore.save_key(key)
+    except Exception as e:                                        # noqa: BLE001
+        print(f"Не удалось сохранить: {e}", file=sys.stderr)
+        return 1
+    print(f"Сохранено: {keystore.describe_location()}")
+    print("Расположение не привязано к установке скилла — переустановка/перенос скилла ключ не затронет.")
+    print("Дальше используйте: python rospatent.py <команда> — ключ подхватится автоматически.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -294,7 +331,13 @@ def main() -> int:
     i.add_argument("--lang", default="ru")
     i.add_argument("--count", type=int, default=15)
 
+    sub.add_parser("set-key", help="сохранить ROSPATENT_API_KEY в защищённое хранилище ОС "
+                                   "(разово на компьютер, не на установку скилла)")
+
     a = ap.parse_args()
+
+    if a.cmd == "set-key":
+        return _cmd_set_key()
 
     c = Client(priority=a.priority, outdir=a.out or None)
 

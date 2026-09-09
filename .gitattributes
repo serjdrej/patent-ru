@@ -1,7 +1,0 @@
-# Репозиторий кросс-платформенный (Windows PowerShell + macOS/bash). LF везде,
-# включая .ps1 (PowerShell читает LF нормально), кроме .sh — там принудительный
-# LF обязателен: скрипт с CRLF в shebang ("#!/bin/bash\r") не запустится на
-# macOS/Linux ("bad interpreter"). Строка ниже действует независимо от
-# локального autocrlf у любого, кто клонирует репозиторий.
-* text=auto eol=lf
-*.sh text eol=lf
