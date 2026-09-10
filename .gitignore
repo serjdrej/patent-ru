@@ -5,8 +5,9 @@ __pycache__/
 
 # Устаревшее расположение ключа ROSPATENT_API_KEY — начиная с этой версии ключ
 # хранится вне дерева скилла (%LOCALAPPDATA%\rospatent на Windows, Keychain на
-# macOS — см. scripts/keystore.py и .secrets/README.txt). Каталог оставлен в
-# .gitignore на случай, если у кого-то ещё сохранился файл здесь со старой
-# версии скилла: rospatent.py сам перенесёт его при первом обычном запуске.
-.secrets/*
-!.secrets/README.txt
+# macOS — см. scripts/keystore.py). Каталог полностью игнорируется (без
+# исключений — трекать dot-prefixed путь в этом репозитории не нужно, см.
+# docs/review-checklist.md в ru-legal-skills про импорт в lazy-skill-library)
+# на случай, если у кого-то ещё сохранился файл здесь со старой версии
+# скилла: rospatent.py сам перенесёт его при первом обычном запуске.
+.secrets/
