@@ -76,10 +76,9 @@ scripts/      — 5 скриптов, чистый stdlib (кроме pdftotext 
 **Статус:** самостоятельный репозиторий, входит в маркетплейс
 [`ru-legal-skills`](https://github.com/serjdrej/ru-legal-skills) вместе с
 [`legal-ru`](https://github.com/serjdrej/legal-ru) и
-[`gost-ed-mashiny`](https://github.com/serjdrej/gost-ed-mashiny). Также ранее
-был вручную импортирован в библиотеку скиллов `lazy-skill-library` — та копия
-на данный момент отстаёт от этого репозитория (не пересинхронизирована после
-переработки хранения ключа и добавления `ipc`/`datasets`/`group_by`).
+[`gost-ed-mashiny`](https://github.com/serjdrej/gost-ed-mashiny) — это и есть
+актуальный канал распространения; сторонние копии этого скилла вне репозитория
+и маркетплейса не поддерживаются и могут отставать.
 
 **Тестирование:** регрессионные тесты (см. `references/audit-compliance.md`,
 раздел 4) прогонялись на живом деле № ⟦НОМЕР ЗАЯВКИ⟧/07(⟦ДОСЬЕ⟧) и проходят — эта
