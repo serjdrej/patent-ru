@@ -125,6 +125,7 @@ python scripts/rospatent.py search '(веха OR "измерительная ш�
 | Скрипт | Роль |
 |---|---|
 | `scripts/rospatent.py` | клиент API Роспатента: `search`/`doc`/`similar`/`datasets`/`ipc`/`set-key`, ретраи, три-счёт |
+| `scripts/ips_lookup.py` | Официальная ИПС «Законодательство России»: `find` находит акт и его `nd`, `redactions` перечисляет редакции, `text <nd> --article M` отдаёт **сводный текст статьи** (проверено на ГК РФ ч. 4, `nd=102110716`, ст. 1363). Без ключа. Дат вступления редакций в силу не даёт. |
 | `scripts/keystore.py` | хранилище ключа вне дерева скилла: DPAPI (Windows) / Keychain (macOS), без сторонних пакетов; используется `rospatent.py` автоматически |
 | `scripts/claims_integrity.py` | ссылочная целостность формулы и безопасная перенумерация (`check` / `renum`) |
 | `scripts/novelty_check.py` | новая материя (`ngram`) и неопределённые обозначения (`symbols`) |
