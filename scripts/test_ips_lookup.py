@@ -27,6 +27,9 @@ Run it directly:
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import re
 import sys
 import unittest
@@ -46,6 +49,11 @@ ND_GK1 = "102033239"
 ND_APK = "102079219"
 RDK_APK_NOT_PREPARED = 30
 
+# Постановление Правительства РФ от 24.10.2022 № 1885 - an act with no
+# articles at all: it is divided into пункты, so `--article` on it can only
+# ever fail, and the failure must not read as "такой нормы нет".
+ND_POSTANOVLENIE = "603486228"
+
 NONSENSE_TITLE = "зыфвуацйщкнесуществующийзаконъё918273465"
 
 # Wording of ч. 23 ст. 26 introduced by 496-ФЗ (current redaction only).
@@ -60,6 +68,15 @@ WORDING_OLD = "до дня официального опубликования �
 def part_23(article_text: str) -> str:
     match = re.search(r"(?ms)^23\.\s.*?(?=^24\.\s|\Z)", article_text)
     return match.group(0) if match else ""
+
+
+def run_text(*argv: str) -> tuple[int, dict]:
+    """The `text` command as the CLI runs it, without a subprocess."""
+    args = ips_lookup.make_parser().parse_args(["text", *argv])
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = ips_lookup._run_text(args)
+    return code, json.loads(buffer.getvalue())
 
 
 class AddressingTest(unittest.TestCase):
@@ -296,6 +313,248 @@ class ConsolidatedTextTest(unittest.TestCase):
         self.assertGreater(len(prepared["text"]), 100000, prepared["chars"])
 
 
+class TimeoutRetryTest(unittest.TestCase):
+    """The retry on timeout, tested without the network.
+
+    Every other test here is live, because the point of this module is what a
+    real server returns. This one cannot be: a timeout is exactly the condition
+    that cannot be summoned on demand — which is also why this path would
+    otherwise ship unexercised and rot. The transport is stubbed instead.
+    """
+
+    def _run_with(self, outcomes: list) -> tuple[object, int]:
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):  # noqa: ANN001
+            calls["n"] += 1
+            outcome = outcomes[min(calls["n"] - 1, len(outcomes) - 1)]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        real_urlopen, real_sleep = ips_lookup.urlopen, ips_lookup.time.sleep
+        ips_lookup.urlopen = fake_urlopen
+        ips_lookup.time.sleep = lambda _seconds: None
+        try:
+            try:
+                return ips_lookup._get("http://example.invalid/x"), calls["n"]
+            except IpsError as exc:
+                return exc, calls["n"]
+        finally:
+            ips_lookup.urlopen, ips_lookup.time.sleep = real_urlopen, real_sleep
+
+    class _Response:
+        status = 200
+
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> bool:
+            return False
+
+    def test_a_timeout_is_retried_once_and_can_succeed(self) -> None:
+        """The whole point: a transient slow export must not end the call."""
+        result, attempts = self._run_with(
+            [TimeoutError("slow"), self._Response(b"payload")]
+        )
+        self.assertEqual(b"payload", result, "the retry did not return the second answer")
+        self.assertEqual(2, attempts, "expected exactly one retry")
+
+    def test_a_second_timeout_fails_loudly_and_stops(self) -> None:
+        """One retry, never a loop - and the failure says the retry happened."""
+        result, attempts = self._run_with([TimeoutError("slow")])
+        self.assertIsInstance(
+            result, IpsError, "a persistent timeout must surface as IpsError, not bare"
+        )
+        self.assertEqual(2, attempts, "retried more than once - this must not loop")
+        self.assertIn("retried once automatically", str(result))
+
+
+class CommencementTest(unittest.TestCase):
+    """Entry-into-force clauses are read from the amending acts themselves.
+
+    The IPS does not carry them: its redaction list gives the signing date of
+    each amending act and nothing else. The clause does exist, in the amending
+    act's own final article, and this walks there and quotes it. The assertions
+    below are about the boundary being real, not about a computed answer — the
+    module deliberately computes none.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            cls.result = ips_lookup.redactions(
+                ND_342, on_date="10.02.2023", with_commencement=True
+            )
+        except IpsError as exc:
+            raise unittest.SkipTest(f"pravo.gov.ru IPS unreachable: {exc}") from exc
+
+    def test_the_boundary_redaction_and_the_next_one_are_both_read(self) -> None:
+        block = self.result.get("commencement") or {}
+        self.assertEqual([3, 4], block.get("checked_redactions"))
+        self.assertLessEqual(len(block.get("acts", [])), block.get("max_acts", 0))
+
+    def test_the_next_redaction_commenced_after_the_asked_date(self) -> None:
+        """What makes the upper bound meaningful rather than arithmetic.
+
+        469-ФЗ was signed 04.08.2023 and commences 01.09.2024 — after
+        10.02.2023 either way. If this ever quoted a date before the asked one,
+        the bound would be wrong and the tool would be pointing at the wrong
+        redaction of the act.
+        """
+        acts = {a["rdk"]: a for a in (self.result.get("commencement") or {}).get("acts", [])}
+        clauses = " ".join(acts[4].get("clauses") or [])
+        self.assertIn("2024", clauses, acts[4])
+        self.assertTrue(acts[4]["resolved"], acts[4])
+
+    def test_no_in_force_redaction_is_ever_asserted(self) -> None:
+        """The one thing this must not do: answer the legal question itself."""
+        serialised = json.dumps(self.result, ensure_ascii=False)
+        for forbidden in ("rdk_in_force", "in_force_redaction", "applicable_rdk"):
+            self.assertNotIn(forbidden, serialised)
+        self.assertIn("ВЕРХНЯЯ ГРАНИЦА", serialised)
+
+
+class DocumentHeadingTest(unittest.TestCase):
+    """The result must name the act, not only its nd.
+
+    An nd is not self-checking. A subagent verifying a citation reached for
+    102108261 believing it to be 218-ФЗ, got an honest "article not found" from
+    152-ФЗ «О персональных данных», and reported that the cited article does not
+    exist — a true answer about the wrong act, indistinguishable from a real
+    finding. The heading makes that mistake announce itself.
+    """
+
+    def test_the_heading_names_the_act(self) -> None:
+        try:
+            personal_data = ips_lookup.document_text("102108261")
+            registration = ips_lookup.document_text("102376335")
+        except IpsError as exc:
+            raise unittest.SkipTest(f"pravo.gov.ru IPS unreachable: {exc}") from exc
+        self.assertIn("О персональных данных", personal_data["document_heading"])
+        self.assertIn("регистрации недвижимости", registration["document_heading"])
+        self.assertNotEqual(
+            personal_data["document_heading"], registration["document_heading"]
+        )
+
+    def test_the_heading_stops_before_the_body(self) -> None:
+        """A stop rule that never fires is how a stray control byte hid here.
+
+        The pattern held a literal 0x08 instead of a word boundary, so nothing
+        ever matched and the heading ran on into "Принят Государственной Думой".
+        The only symptom was a slightly long string - visible, but easy to read
+        past.
+        """
+        heading = ips_lookup._document_heading(
+            "\n".join(
+                [
+                    "Complex",
+                    "РОССИЙСКАЯ ФЕДЕРАЦИЯ",
+                    "ФЕДЕРАЛЬНЫЙ ЗАКОН",
+                    "О чём-то",
+                    "Принят Государственной Думой 8 июля 2006 года",
+                    "Статья 1. Начало",
+                ]
+            )
+        )
+        self.assertIn("О чём-то", heading)
+        self.assertNotIn("Принят", heading)
+        self.assertNotIn("Complex", heading)
+
+
+class ArticleAbsenceTest(unittest.TestCase):
+    """«Статья N не найдена» must say which of two things it means.
+
+    In an act that has articles it means the article is not among them: wrong
+    act, or repealed. In an act that has none it means the question was put to
+    the wrong shape of document — a постановление is divided into пункты, and
+    asking it for an article can only ever fail. Both used to come back as the
+    same sentence, which is the shape this family keeps catching: an absence
+    that reads as "такой нормы не существует".
+    """
+
+    ARTICLED = """Статья 1. Первая
+Тело первой статьи.
+Статья 2
+. Вторая
+Тело второй статьи.
+"""
+    CLAUSED = """1. Первый пункт.
+2. Второй пункт.
+3. Третий пункт.
+"""
+
+    def test_the_count_is_the_extractors_own_notion_of_a_heading(self) -> None:
+        """A count that disagreed with the extractor would be worse than none."""
+        self.assertEqual(2, ips_lookup.count_article_headings(self.ARTICLED))
+        self.assertIsNotNone(extract_article(self.ARTICLED, "1"))
+        self.assertIsNotNone(extract_article(self.ARTICLED, "2"))
+        self.assertEqual(0, ips_lookup.count_article_headings(self.CLAUSED))
+
+    def test_an_act_without_articles_says_so(self) -> None:
+        report = ips_lookup.article_absence_report(self.CLAUSED, "5", "ПОСТАНОВЛЕНИЕ", "1")
+        self.assertFalse(report["article_found"])
+        self.assertFalse(report["act_uses_articles"])
+        self.assertEqual(0, report["article_headings_in_act"])
+        self.assertIn("пункт", report["note"])
+
+    def test_an_act_with_articles_reports_how_many(self) -> None:
+        report = ips_lookup.article_absence_report(self.ARTICLED, "5", "ЗАКОН", "1")
+        self.assertTrue(report["act_uses_articles"])
+        self.assertEqual(2, report["article_headings_in_act"])
+
+    def test_the_two_absences_do_not_share_a_sentence(self) -> None:
+        clauses = ips_lookup.article_absence_report(self.CLAUSED, "5", "ПОСТАНОВЛЕНИЕ", "1")
+        articles = ips_lookup.article_absence_report(self.ARTICLED, "5", "ЗАКОН", "1")
+        self.assertNotEqual(clauses["note"], articles["note"])
+
+
+class ArticleFlagOutputTest(unittest.TestCase):
+    """`chars` must measure the text that is present, not the one removed."""
+
+    def test_a_clause_only_act_is_a_readable_negative(self) -> None:
+        try:
+            full = document_text(ND_POSTANOVLENIE)
+        except IpsError as exc:
+            raise unittest.SkipTest(f"pravo.gov.ru IPS unreachable: {exc}") from exc
+        self.assertEqual(0, ips_lookup.count_article_headings(full["text"]))
+        code, payload = run_text(ND_POSTANOVLENIE, "--article", "5")
+        self.assertEqual(1, code)
+        self.assertFalse(payload["article_found"])
+        self.assertFalse(payload["act_uses_articles"])
+        self.assertEqual(0, payload["article_headings_in_act"])
+        self.assertNotIn("text", payload)
+        self.assertNotIn(
+            "chars", payload, "chars kept measuring the text that was removed"
+        )
+        self.assertEqual(full["chars"], payload["document_chars"])
+
+    def test_a_found_article_reports_its_own_length(self) -> None:
+        try:
+            code, payload = run_text(ND_342, "--article", "26")
+        except IpsError as exc:
+            raise unittest.SkipTest(f"pravo.gov.ru IPS unreachable: {exc}") from exc
+        self.assertEqual(0, code)
+        self.assertTrue(payload["article_found"])
+        self.assertEqual(len(payload["text"]), payload["chars"])
+        self.assertGreater(payload["document_chars"], payload["chars"])
+
+    def test_head_truncation_does_not_leave_a_stale_count(self) -> None:
+        try:
+            code, payload = run_text(ND_342, "--article", "26", "--head", "500")
+        except IpsError as exc:
+            raise unittest.SkipTest(f"pravo.gov.ru IPS unreachable: {exc}") from exc
+        self.assertEqual(0, code)
+        self.assertTrue(payload["head_truncated"])
+        self.assertEqual(len(payload["text"]), payload["chars"])
+
+
 class ThisSkillsOwnActTest(unittest.TestCase):
     """One live check that the tool reaches what *this* skill actually cites.
 
@@ -339,6 +598,11 @@ def main() -> int:
             loader.loadTestsFromTestCase(RedactionListTest),
             loader.loadTestsFromTestCase(ConsolidatedTextTest),
             loader.loadTestsFromTestCase(ThisSkillsOwnActTest),
+            loader.loadTestsFromTestCase(TimeoutRetryTest),
+            loader.loadTestsFromTestCase(CommencementTest),
+            loader.loadTestsFromTestCase(DocumentHeadingTest),
+            loader.loadTestsFromTestCase(ArticleAbsenceTest),
+            loader.loadTestsFromTestCase(ArticleFlagOutputTest),
         ]
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

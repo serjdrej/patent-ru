@@ -42,7 +42,16 @@ Two limits of the source itself, both surfaced rather than smoothed over. The
 redaction list carries the **signing date and number of each amending act, not
 the date on which each redaction entered into force**, so this module cannot
 state which redaction was in force on a given date; ``redactions --on-date``
-returns only an explicitly-labelled upper bound. And the system does not hold
+returns only an explicitly-labelled upper bound. The clause itself is not lost,
+though: it lives in the amending act's own final article, and
+``--with-commencement`` walks there and quotes it verbatim — for the boundary
+redaction and the one after it, never for the whole history, since ГК ч. 4 alone
+would be 314 requests. Nothing is inferred from those clauses: commencement is
+routinely staged ("Пункт 4 ... вступают в силу с 1 сентября 2022 года") or
+relative to publication, the matched sentences can include cross-references to
+*other* acts, and which redaction governs a relationship formed earlier is a
+question about the operation of law in time. A label marking the operative
+clause was tried and removed — it was confidently wrong in both directions. And the system does not hold
 consolidated text for every redaction it lists: some carry «(не готова)» and
 answer a text request with an empty RTF stub. For АПК РФ that is 25 of the 90
 listed redactions (indices 30-54, 2014-2018). Those are reported in
@@ -58,6 +67,7 @@ import html as html_module
 import json
 import re
 import sys
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -67,6 +77,10 @@ from urllib.request import Request, urlopen
 BASE_URL = "http://pravo.gov.ru/proxy/ips/"
 CHARSET = "windows-1251"
 TIMEOUT_SECONDS = 180
+# One retry only, after a short pause: long enough that a server briefly
+# under load is not hit again instantly, short enough that a caller waiting
+# on a timeout is not left wondering. Never a loop.
+RETRY_PAUSE_SECONDS = 3
 PAGE_SIZE = 20
 BPAS_FEDERAL = "cd00000"
 MIN_PLAUSIBLE_TEXT_CHARS = 200
@@ -103,7 +117,7 @@ class IpsError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _get(url: str) -> bytes:
+def _get(url: str, _retrying: bool = False) -> bytes:
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"})
     try:
         with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
@@ -123,7 +137,30 @@ def _get(url: str) -> bytes:
             "repository runs on. If HTTP also fails, do not assume a result."
         ) from exc
     except TimeoutError as exc:
-        raise IpsError(f"Timed out after {TIMEOUT_SECONDS} seconds reaching {url}.") from exc
+        # The slowness is the server's and it comes and goes: ГК ч. 4 was measured
+        # at 161 s and at over 180 s on one day, and at 1.8 s three runs running on
+        # another - same URL, same document. Raising the limit narrows the window
+        # without closing it, so one bounded retry is the actual remedy. Plausibly
+        # the first attempt helps the second, since a slow answer looks like the
+        # export being generated and a fast one like it being served ready - a
+        # hypothesis, untestable without catching the server slow on demand, but
+        # the retry earns its single extra request regardless. One retry, never a
+        # loop: this module does not do bulk retrieval.
+        if not _retrying:
+            time.sleep(RETRY_PAUSE_SECONDS)
+            return _get(url, _retrying=True)
+        raise IpsError(
+            f"Timed out after {TIMEOUT_SECONDS} seconds reaching {url}. On a large act "
+            "this usually means the export was slow, not that the act is unavailable: "
+            "ГК ч. 4 (605 871 characters) was measured twice on the same input and took "
+            "161 s once and over 180 s the other time, while on another day the same "
+            "URL answered in 1.8 s three runs running - the slowness is the server's "
+            "and it comes and goes. This was already retried once automatically and "
+            "timed out twice, so a third attempt by hand is worth trying later rather "
+            "than immediately. --article N does NOT avoid this: the whole act is "
+            "fetched first and the article is cut out of the text already in hand, so "
+            "that path costs exactly the same request and times out identically."
+        ) from exc
 
 
 def _url(mode: str, params: list[tuple[str, str]]) -> str:
@@ -332,7 +369,9 @@ def _fetch_card(nd: str) -> dict[str, Any]:
     return {"url": url, "text": text, "status": status.group(1).strip() if status else None}
 
 
-def redactions(nd: str, on_date: str | None = None) -> dict[str, Any]:
+def redactions(
+    nd: str, on_date: str | None = None, with_commencement: bool = False
+) -> dict[str, Any]:
     """The redaction list, cross-checked against the act's own status line."""
     if not re.fullmatch(r"\d+", nd):
         raise IpsError(f"nd must be digits, got {nd!r}.")
@@ -455,7 +494,105 @@ def redactions(nd: str, on_date: str | None = None) -> dict[str, Any]:
             "text_available_for_that_rdk": bool(bounded and bounded["text_available"]),
             "caveat": ON_DATE_CAVEAT,
         }
+        if with_commencement:
+            result["commencement"] = _commencement_around(entries, bound)
     return result
+
+
+COMMENCEMENT_MAX_ACTS = 3
+
+COMMENCEMENT_CAVEAT = (
+    "Оговорки приведены ДОСЛОВНО из текста изменяющих актов и не истолкованы. "
+    "Скрипт не вычисляет, какая редакция применима: оговорка бывает ступенчатой "
+    "(разные статьи вступают в силу в разные дни) и относительной («по истечении "
+    "ста восьмидесяти дней со дня официального опубликования»), а какая редакция "
+    "применяется к отношениям, возникшим до изменения, - вопрос действия закона "
+    "во времени, то есть правовой, а не справочный. Среди найденных предложений "
+    "могут быть перекрёстные ссылки на вступление в силу ДРУГИХ актов: отделить "
+    "их автоматически не удалось (попытка пометить давала ошибки в обе стороны), "
+    "поэтому возвращается всё найденное и читать надо глазами."
+)
+
+COMMENCEMENT_SENTENCE = re.compile(
+    r"[^.\n]{0,200}?вступа\w+ в силу[^.\n]{0,300}\.", re.I
+)
+
+
+def commencement(number: str, signed: str) -> dict[str, Any]:
+    """Читает оговорку о вступлении в силу из текста самого изменяющего акта.
+
+    ИПС не хранит дат вступления редакций в силу — в перечне только дата
+    подписания изменяющего акта. Но сама оговорка есть в тексте этого акта
+    («Настоящий Федеральный закон вступает в силу с 31 декабря 2025 года»),
+    а текст мы умеем получать. Так что дата не ищется, а выводится из
+    первоисточника — и возвращается дословно, без истолкования.
+    """
+    found = find(number=number, date=signed)
+    documents = found.get("documents") or []
+    if len(documents) != 1:
+        return {
+            "number": number,
+            "signed": signed,
+            "resolved": False,
+            "candidates": len(documents),
+            "note": (
+                "Изменяющий акт не опознан однозначно по номеру и дате подписания "
+                f"(найдено: {len(documents)}). Оговорка не читалась - без точного "
+                "акта она была бы взята неизвестно откуда."
+            ),
+        }
+    document = documents[0]
+    body = document_text(document["nd"])
+    # Everything matching is returned verbatim and nothing is labelled as the
+    # operative clause. A label was tried and removed: keying on "настоящего
+    # Федерального закона" called a cross-reference fragment of 469-ФЗ this
+    # act's own commencement, and called "Пункт 1 статьи 6 вступает в силу с 1
+    # января 2024 года" — which is its own — someone else's. Wrong in both
+    # directions, and a confident wrong label is worse than no label: it reads
+    # as an answer. The clauses are short, the reader can see which is which.
+    sentences = [
+        re.sub(r"\s+", " ", match.group(0)).strip()
+        for match in COMMENCEMENT_SENTENCE.finditer(body.get("text", ""))
+    ]
+    return {
+        "number": number,
+        "signed": signed,
+        "resolved": True,
+        "nd": document["nd"],
+        "header": document.get("header"),
+        "clauses": sentences,
+        "note": (
+            "В тексте акта не нашлось фразы о вступлении в силу. Это не значит, что "
+            "её нет: формулировка могла быть иной. Прочитайте текст целиком."
+            if not sentences
+            else None
+        ),
+    }
+
+
+def _commencement_around(entries: list[dict[str, Any]], bound: int) -> dict[str, Any]:
+    """Оговорки только у редакций вокруг границы, а не у всех подряд.
+
+    У ГК ч. 4 157 редакций; читать их все - это 314 запросов и ровно та массовая
+    выкачка, которой здесь нет. Вопрос всегда локальный («что действовало на
+    такую-то дату»), поэтому берутся сама граница и следующая за ней: первая
+    показывает, вступила ли она в силу к дате, вторая - не вступила ли уже и она.
+    """
+    wanted = [e for e in entries if e["rdk"] in (bound, bound + 1) and e["amending_act_number"]]
+    resolved = []
+    for entry in wanted[:COMMENCEMENT_MAX_ACTS]:
+        resolved.append(
+            {
+                "rdk": entry["rdk"],
+                **commencement(entry["amending_act_number"], entry["amending_act_signed"]),
+            }
+        )
+    return {
+        "checked_redactions": [e["rdk"] for e in wanted[:COMMENCEMENT_MAX_ACTS]],
+        "max_acts": COMMENCEMENT_MAX_ACTS,
+        "acts": resolved,
+        "caveat": COMMENCEMENT_CAVEAT,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +617,35 @@ def _decode_mhtml(raw: bytes, url: str) -> str:
     if not chunks:
         raise IpsError(f"{url} returned an archive with no decodable part.")
     return _strip_html("\n".join(chunks))
+
+
+HEADING_JUNK = re.compile(r"^(Complex|Print|false|true|MicrosoftInternetExplorer\d*|\d+)$", re.I)
+HEADING_STOP = re.compile(
+    r"^(Принят|Одобрен|ПОСТАНОВЛЯЮ|УКАЗЫВАЮ|Статья\s|Глава\s|Раздел\s|\d+\.)", re.I
+)
+
+
+def _document_heading(text: str) -> str:
+    """The act's own title, read off the top of its export.
+
+    Without it the output of ``text`` identifies the act only by ``nd``, and an
+    nd is not self-checking: a subagent verifying a citation reached for
+    102108261 believing it to be 218-ФЗ, got an honest "article not found" from
+    152-ФЗ «О персональных данных», and reported that the cited article does not
+    exist. The answer was true about the wrong act. A heading in the result and
+    in that very message makes the mistake announce itself.
+    """
+    parts: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or HEADING_JUNK.match(line):
+            continue
+        if HEADING_STOP.match(line):
+            break
+        parts.append(line)
+        if len(parts) >= 4:
+            break
+    return " · ".join(parts)[:200]
 
 
 def document_text(nd: str, rdk: int | None = None) -> dict[str, Any]:
@@ -524,9 +690,61 @@ def document_text(nd: str, rdk: int | None = None) -> dict[str, Any]:
         "nd": nd,
         "rdk": rdk,
         "url": url,
+        "document_heading": _document_heading(text),
         "chars": len(text),
         "amendment_note_in_text": note.group(0) if note else None,
         "text": text,
+    }
+
+
+# One definition of "a heading" for both the extractor's end boundary and the
+# count below. If the two ever drifted apart, the count would be a second
+# opinion about the extractor's own work - and a wrong one is worse than none.
+ARTICLE_HEADING = re.compile(r"(?m)^\s*Статья\s+\d\S*")
+
+
+def count_article_headings(text: str) -> int:
+    """How many articles the act has at all - the number that makes an absence readable."""
+    return len(ARTICLE_HEADING.findall(text))
+
+
+def article_absence_report(text: str, number: str, heading: str | None, nd: str) -> dict:
+    """The fields and the sentence for "статья N не найдена".
+
+    Two different facts used to arrive as one sentence. An act that has 47
+    articles and not the one asked for is saying the article is not there:
+    wrong act, or repealed. An act that has no articles at all is saying the
+    question does not apply to it - a постановление or a приказ is divided into
+    пункты, so `--article` on one can only ever fail, however plainly the пункт
+    stands in the text the script already holds. Read as the first, the second
+    becomes "такой нормы не существует", which is the failure this family has
+    now caught seven times.
+    """
+    total = count_article_headings(text)
+    where = f"«{heading or '?'}» (nd={nd})"
+    if total == 0:
+        note = (
+            f"В акте {where} НЕТ НИ ОДНОЙ СТАТЬИ ({len(text)} символов текста "
+            f"разобрано): он делится не на статьи - у постановлений, приказов, "
+            f"правил и положений это обычно пункты. Поэтому «статья {number} не "
+            f"найдена» здесь означает только одно: флаг --article к этому акту "
+            f"неприменим. Это НЕ значит, что нормы не существует. Повторите "
+            f"запрос как `text {nd}` без --article и найдите пункт в тексте."
+        )
+    else:
+        note = (
+            f"Статья {number} не найдена в тексте акта {where}. В акте {total} "
+            f"статей, то есть на статьи он делится - значит это содержательный "
+            f"отрицательный ответ (статья могла быть не в этом акте или утратить "
+            f"силу), а не сбой: текст получен и разобран ({len(text)} символов). "
+            f"**Сначала сверьте название акта выше с тем, который вы искали** - "
+            f"«не найдена» в чужом акте читается как «нормы не существует»."
+        )
+    return {
+        "article_found": False,
+        "act_uses_articles": total > 0,
+        "article_headings_in_act": total,
+        "note": note,
     }
 
 
@@ -545,7 +763,7 @@ def extract_article(text: str, number: str) -> str | None:
     # document - 189 000 characters of articles 1363 through 1400, reported as
     # a successful extraction. Match a heading at the start of a line whatever
     # follows it.
-    end = re.search(r"(?m)^\s*Статья\s+\d\S*", rest)
+    end = ARTICLE_HEADING.search(rest)
     body = rest[: end.start()] if end else rest
     article = (start.group(0).strip() + "\n" + body.strip()).strip()
     # The export puts the article heading and its name on separate lines, which
@@ -581,6 +799,12 @@ def make_parser() -> argparse.ArgumentParser:
     reds = commands.add_parser("redactions", help="список редакций акта")
     reds.add_argument("nd")
     reds.add_argument("--on-date", default=None, help="ДД.ММ.ГГГГ - только верхняя граница")
+    reds.add_argument(
+        "--with-commencement",
+        action="store_true",
+        help="дочитать оговорку о вступлении в силу из текста изменяющих актов "
+        "вокруг границы (не более 3 актов); требует --on-date",
+    )
 
     text = commands.add_parser("text", help="текст редакции")
     text.add_argument("nd")
@@ -597,7 +821,11 @@ def _run_find(args: argparse.Namespace) -> int:
 
 
 def _run_redactions(args: argparse.Namespace) -> int:
-    result = redactions(args.nd, args.on_date)
+    if args.with_commencement and args.on_date is None:
+        print("--with-commencement работает только вместе с --on-date: без даты"
+              " неизвестно, вокруг какой границы читать.", file=sys.stderr)
+        return 2
+    result = redactions(args.nd, args.on_date, args.with_commencement)
     _emit(result)
     return 1 if result.get("not_found") else 0
 
@@ -607,25 +835,32 @@ def _run_text(args: argparse.Namespace) -> int:
     if result.get("text_not_prepared"):
         _emit(result)
         return 1
+    document = result["text"]
     if args.article is not None:
-        body = extract_article(result["text"], args.article)
+        body = extract_article(document, args.article)
         result["article"] = args.article
-        result["article_found"] = body is not None
         if body is None:
+            # `chars` counted the document; dropping the text while keeping the
+            # count leaves a number measuring a field that is no longer here.
             result.pop("text", None)
-            result["note"] = (
-                f"Статья {args.article} не найдена в тексте этой редакции. Это "
-                "содержательный отрицательный ответ (статья могла быть не в этом "
-                "акте или утратить силу), а не сбой: текст получен и разобран "
-                f"({result['chars']} символов)."
+            result.pop("chars", None)
+            result["document_chars"] = len(document)
+            result.update(
+                article_absence_report(
+                    document, args.article, result.get("document_heading"), args.nd
+                )
             )
             _emit(result)
             return 1
+        result["article_found"] = True
         result["text"] = body
         result["chars"] = len(body)
+        result["document_chars"] = len(document)
     if args.head is not None and len(result["text"]) > args.head:
         result["text"] = result["text"][: args.head]
+        result["chars"] = len(result["text"])
         result["head_truncated"] = True
+        result.setdefault("document_chars", len(document))
     _emit(result)
     return 0
 
